@@ -393,15 +393,15 @@ div[data-testid="stChatInput"] div[data-testid="stFileUploader"] section::after 
 """, unsafe_allow_html=True)
 
 # アップローダーの配置 (通常位置で描画するが、JSでチャット入力欄に移動させる)
-uploaded_image = st.file_uploader("", type=["jpg", "jpeg", "png"], label_visibility="collapsed")
+uploaded_file = st.file_uploader("", type=None, label_visibility="collapsed")
 
-# 画像がアップロードされている場合、プレビューを表示
+# ファイルがアップロードされている場合、プレビューを表示
 uploaded_bytes = None
-if uploaded_image:
-    uploaded_bytes = uploaded_image.read()
+if uploaded_file:
+    uploaded_bytes = uploaded_file.read()
     st.markdown(f"""
     <div class="preview-box">
-        <span style="font-size: 12px; color: #ff4b4b; font-weight: bold;">📎 画像添付中: {uploaded_image.name}</span>
+        <span style="font-size: 12px; color: #ff4b4b; font-weight: bold;">📎 ファイル添付中: {uploaded_file.name}</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -409,17 +409,30 @@ if uploaded_image:
 if prompt := st.chat_input("質問を入力してください…"):
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    contents_to_send = [prompt]
+    contents_to_send = []
     
-    if uploaded_image and uploaded_bytes:
-        try:
-            image_part = Part.from_bytes(
-                data=uploaded_bytes,
-                mime_type=uploaded_image.type
-            )
-            contents_to_send.append(image_part)
-        except Exception as e:
-            print(f"画像データの変換エラー: {e}")
+    if uploaded_file and uploaded_bytes:
+        file_name = uploaded_file.name.lower()
+        
+        # 画像またはPDFの場合はPartオブジェクトとして送信
+        if file_name.endswith(('.png', '.jpg', '.jpeg', '.pdf')):
+            try:
+                file_part = Part.from_bytes(
+                    data=uploaded_bytes,
+                    mime_type=uploaded_file.type
+                )
+                contents_to_send.append(file_part)
+            except Exception as e:
+                print(f"ファイルデータの変換エラー: {e}")
+        else:
+            # それ以外のコードやテキストファイルは中身を読み込んでプロンプトに結合する
+            try:
+                text_content = uploaded_bytes.decode("utf-8", errors="ignore")
+                prompt = f"【添付ファイル名: {uploaded_file.name}】\n```\n{text_content}\n```\n\n{prompt}"
+            except Exception as e:
+                print(f"テキスト読み込みエラー: {e}")
+                
+    contents_to_send.append(prompt)
             
     if st.session_state.chat:
         try:
