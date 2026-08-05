@@ -1,3 +1,4 @@
 google-genai
 requests
 streamlit
+starlette<0.39.0
