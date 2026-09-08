@@ -6,28 +6,38 @@ import requests
 import streamlit.components.v1 as components
 import os
 import time
+import io
+from PIL import Image
+from streamlit_drawable_canvas import st_canvas
 from google.genai.types import Part
 
 # =========================================
-#  システムプロンプト
+#  システムプロンプト
 # =========================================
 SYSTEM_PROMPT = """
 あなたは教育的な目的を持つ AI アシスタントです。
-ユーザーの質問に対して以下のルールに従ってできるだけかみ砕いてわかりやすく応答してく
-ださい。
+ユーザーの質問に対して以下のルールに従ってできるだけかみ砕いてわかりやすく応答してください。
 1⃣知識・定義直接答えます。
 2⃣思考・計算問題答えは教えず、解法のヒントのみを示します。
 3⃣途中式正誤を判定し、優しく導きます。
-4⃣専門用語ステップごとに区切り、専門用語について知っているか確認します。知らなかっ
-た場合は、小学生にもわかるように、図や擬音などの表現、例となる面白い文を積極的に使っ
-てその場で説明します。
+4⃣専門用語ステップごとに区切り、専門用語について知っているか確認します。知らなかった場合は、小学生にもわかるように、図や擬音などの表現、例となる面白い文を積極的に使ってその場で説明します。
 5⃣説明は砕けた会話口調でお願いします。
-6⃣いきなりステップを全部出さないでください。「ここで、～～について知っていますか？」
-のところでいったん表示するのをやめてください。
-7⃣専門用語や途中の過程の分からない部分について説明されたときは、できるだけ詳しく説明
-してください。だからと言ってその説明を聞いている人に読むのを飽きさせてしまうような説
-明はやめてください。
-
+6⃣いきなりステップを全部出さないでください。「ここで、～～について知っていますか？」のところでいったん表示するのをやめてください。
+7⃣専門用語や途中の過程の分からない部分について説明されたときは、できるだけ詳しく説明してください。だからと言ってその説明を聞いている人に読むのを飽きさせてしまうような説明はやめてください。
+8⃣ヒント・ギブアップ要請への対応:
+- 【ヒント1要請】: 答えや計算式は出さず、この問題を解くための「着眼点（何に注目すべきか）」だけを優しく短めに教えてください。
+- 【ヒント2要請】: 答えは出さず、この問題で「使うべき公式・考え方・定理」を優しく教えてください。
+- 【ヒント3要請】: 最後の答えは出さず、「解法の最初の一歩（式変形の1行目など）」を具体的に示して、続きを自分で解けるように導いてください。
+- 【ギブアップ要請】: ここまで一生懸命考えた努力を惜しみなく褒めた上で、完全な答えとステップバイステップの丁寧な全解説を優しく教えてください。
+9⃣学習サポート機能への対応:
+- 【類題出題要請】: 直前の問題と同じ解法・公式パターンを使い、数値や設定を変えた「新しい類題」を1問出題してください。指定された難易度に応じた問題文のみを提示し、答えや解説は書かずに「さあ、解いてみてね！」と元気よく促してください。
+- 【手書きメモ添削要請】: ユーザーの手書き途中式やメモの画像を解析し、赤ペン先生のように「どこまで合っているか」を褒め、間違えている部分があればその箇所と正しい考え方を優しく教えてください。
+- 【理解度クイズ出題要請】: 直前の問題の要点や重要公式に関する「3択クイズ」を1問作成してください。出力は必ず以下の書式を含めてください：
+  【問題】（ここに問題文）
+  【A】（選択肢1）
+  【B】（選択肢2）
+  【C】（選択肢3）
+- 【ニガテ帳まとめ要請】: これまでの学習履歴を振り返り、つまずいたポイント、重要公式・定理、ユッキーからの応援アドバイスをMarkdown形式の「復習まとめノート」として綺麗に整理して出力してください。
 """
 
 # =========================================
@@ -37,6 +47,59 @@ try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except:
     API_KEY = ""
+
+# =========================================
+# ユーザーデータ永続化モジュール (JSONストレージ)
+# =========================================
+USER_DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "users")
+os.makedirs(USER_DATA_DIR, exist_ok=True)
+
+def get_current_user_id():
+    """現在ログイン中のユーザーID（またはゲストID）を返す"""
+    if getattr(st.user, "is_logged_in", False):
+        return getattr(st.user, "sub", None) or getattr(st.user, "email", "google_user")
+    return "guest_user"
+
+def get_user_data_path(user_id):
+    safe_id = "".join(c for c in str(user_id) if c.isalnum() or c in ("-", "_"))
+    return os.path.join(USER_DATA_DIR, f"{safe_id}.json")
+
+def load_user_data(user_id):
+    path = get_user_data_path(user_id)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"ユーザーデータ読み込みエラー: {e}")
+    return {
+        "stars": 0,
+        "stamps": 0,
+        "summary_note": "",
+        "last_active": ""
+    }
+
+def save_user_data(user_id):
+    path = get_user_data_path(user_id)
+    data = {
+        "user_id": user_id,
+        "stars": st.session_state.get("stars", 0),
+        "stamps": st.session_state.get("stamps", 0),
+        "summary_note": st.session_state.get("summary_note", ""),
+        "last_active": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"ユーザーデータ保存エラー: {e}")
+
+def is_auth_configured():
+    """Google認証がsecrets.tomlに設定されているか判定"""
+    try:
+        return "auth" in st.secrets
+    except Exception:
+        return False
     
 
 def get_base64_image(image_path):
@@ -47,7 +110,7 @@ def get_base64_image(image_path):
     return ""
 
 # 画像の準備
-IMG_ICON_B64 = get_base64_image("yukki-icon.jpg")
+IMG_ICON_B64 = get_base64_image("yukki-close.jpg")
 IMG_OPEN_B64 = get_base64_image("yukki-open.jpg")
 IMG_CLOSE_B64 = get_base64_image("yukki-close.jpg")
 
@@ -136,8 +199,77 @@ if "latest_assistant_message" not in st.session_state:
 if "msg_counter" not in st.session_state:
     st.session_state.msg_counter = 0
 
+if "hint_level" not in st.session_state:
+    st.session_state.hint_level = 1
+
+# ユーザーごとの永続化データの読み込み
+current_user_id = get_current_user_id()
+if "loaded_user_id" not in st.session_state or st.session_state.loaded_user_id != current_user_id:
+    saved_data = load_user_data(current_user_id)
+    st.session_state.stars = saved_data.get("stars", 0)
+    st.session_state.stamps = saved_data.get("stamps", 0)
+    st.session_state.summary_note = saved_data.get("summary_note", "")
+    st.session_state.loaded_user_id = current_user_id
+
+if "stars" not in st.session_state:
+    st.session_state.stars = 0
+
+if "stamps" not in st.session_state:
+    st.session_state.stamps = 0
+
+if "canvas_key_num" not in st.session_state:
+    st.session_state.canvas_key_num = 0
+
+if "show_gacha" not in st.session_state:
+    st.session_state.show_gacha = False
+
+if "summary_note" not in st.session_state:
+    st.session_state.summary_note = ""
+
 # 📸 サイドバー
 with st.sidebar:
+    # 🔑 Googleログイン & プロフィール
+    is_logged_in = getattr(st.user, "is_logged_in", False)
+    if is_logged_in:
+        user_name = getattr(st.user, "name", "ユーザー")
+        user_email = getattr(st.user, "email", "")
+        user_pic = getattr(st.user, "picture", "")
+
+        st.markdown(f"""
+        <div style="background: #ffffff; border: 1px solid #bbf7d0; border-radius: 12px; padding: 10px 12px; margin-top: 6px; margin-bottom: 12px; display: flex; align-items: center; gap: 10px; box-shadow: 0 2px 5px rgba(34, 197, 94, 0.1);">
+            <img src="{user_pic if user_pic else 'https://www.gstatic.com/images/branding/product/1x/avatar_square_blue_512dp.png'}" style="width: 36px; height: 36px; border-radius: 50%; border: 2px solid #22c55e; object-fit: cover;" />
+            <div style="overflow: hidden; flex: 1;">
+                <div style="font-size: 13px; font-weight: bold; color: #15803d; white-space: nowrap; text-overflow: ellipsis; overflow: hidden;">{user_name}</div>
+                <div style="font-size: 10px; color: #64748b; white-space: nowrap; text-overflow: ellipsis; overflow: hidden;">{user_email}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if st.button("🚪 ログアウト", key="btn_logout", use_container_width=True):
+            save_user_data(st.session_state.loaded_user_id)
+            st.logout()
+    else:
+        if is_auth_configured():
+            st.markdown("""
+            <div style="background: #ffffff; border: 1px solid #fed7aa; border-radius: 12px; padding: 10px; margin-top: 6px; margin-bottom: 8px; text-align: center; box-shadow: 0 2px 5px rgba(249, 115, 22, 0.08);">
+                <div style="font-size: 12px; font-weight: 600; color: #c2410c; margin-bottom: 6px;">Googleで学習データを同期</div>
+            </div>
+            """, unsafe_allow_html=True)
+            if st.button("🔐 Googleでログイン", key="btn_google_login", use_container_width=True):
+                st.login()
+        else:
+            with st.expander("🔐 Googleログインの設定", expanded=False):
+                st.markdown("""
+                <div style="font-size: 11px; line-height: 1.5; color: #475569;">
+                <b>設定手順:</b><br>
+                1. <a href="https://console.cloud.google.com/" target="_blank">Google Cloud Console</a> でOAuth 2.0クライアントを作成<br>
+                2. 承認済みのリダイレクトURIに以下を登録:<br>
+                <code>http://localhost:8501/oauth2callback</code><br>
+                3. <code>.streamlit/secrets.toml.template</code> を元に <code>secrets.toml</code> を作成して入力
+                </div>
+                """, unsafe_allow_html=True)
+            st.caption("※ 現在はゲストモードとして端末内にデータ保存中")
+
     st.markdown("<h3 style='text-align: center; color: #ff4b4b; margin-top: 10px;'>🎀 AIユッキー</h3>", unsafe_allow_html=True)
     
     # 口パク HTML コンポーネントの表示
@@ -283,11 +415,142 @@ with st.sidebar:
     else:
         st.warning("アバター画像が見つかりません。")
 
+    # ⭐ がんばりスコア & スタンプカード
+    st.markdown(f"""
+    <div style="background: white; border: 1px solid #ffd1d1; border-radius: 12px; padding: 12px; margin-top: 10px; box-shadow: 0 2px 6px rgba(255, 75, 75, 0.08);">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <span style="font-size: 13px; font-weight: bold; color: #ff4b4b;">⭐ がんばりスコア</span>
+            <span style="font-size: 14px; font-weight: bold; color: #d97706;">⭐ {st.session_state.stars}</span>
+        </div>
+        <div style="font-size: 11px; color: #64748b; margin-bottom: 6px;">
+            クリアスタンプ: {st.session_state.stamps % 5 if st.session_state.stamps % 5 != 0 or st.session_state.stamps == 0 else 5}/5 問
+        </div>
+        <div style="display: flex; justify-content: space-around; font-size: 18px; margin-bottom: 8px;">
+            {' '.join(['🌸' if i < (5 if st.session_state.stamps > 0 and st.session_state.stamps % 5 == 0 else st.session_state.stamps % 5) else '⚪' for i in range(5)])}
+        </div>
+        <div style="font-size: 11px; font-style: italic; color: #ff6b6b; text-align: center; border-top: 1px dashed #fee2e2; padding-top: 6px;">
+            {'「いっしょにがんばろ！」' if st.session_state.stars < 3 else ('「いい調子！その調子！」' if st.session_state.stars < 8 else '「天才すぎ！ユッキー大感激！💖」')}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # 📑 今日のニガテ帳・まとめカード生成
+    st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
+    if st.button("📑 今日のまとめノート作成", key="btn_make_summary", use_container_width=True):
+        if len(st.session_state.messages) == 0:
+            st.warning("まだ学習履歴がありません。問題を解いた後に押してね！")
+        elif st.session_state.chat:
+            with st.spinner("ユッキーが今日のまとめノートを作成中..."):
+                summary_prompt = "【ニガテ帳まとめ要請】これまでの学習チャット履歴を振り返り、ユーザーがつまずきやすかったポイント、重要公式・定理、ユッキーからの応援アドバイスをMarkdown形式の「復習まとめノート」として綺麗に整理して出力してください。"
+                try:
+                    res = st.session_state.chat.send_message([summary_prompt])
+                    st.session_state.summary_note = res.text if hasattr(res, "text") else str(res)
+                    save_user_data(st.session_state.loaded_user_id)
+                    st.session_state.messages.append({"role": "assistant", "content": f"📑 **【今日のまとめノート】** が完成したよ！サイドバーから保存してね！\n\n{st.session_state.summary_note}"})
+                    st.session_state.latest_assistant_message = "今日のまとめノートが完成したよ！サイドバーからダウンロードできるよ！"
+                    st.session_state.msg_counter += 1
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"作成エラー: {e}")
+
+    if st.session_state.summary_note:
+        st.download_button(
+            label="💾 まとめノートを保存",
+            data=st.session_state.summary_note,
+            file_name="yukki_study_note.md",
+            mime="text/markdown",
+            use_container_width=True
+        )
+
+# =========================================
+# メッセージ送信・AI対話 共通処理
+# =========================================
+def send_message_to_assistant(display_text, ai_prompt=None, attach_bytes=None, attach_file=None):
+    """ユーザーメッセージを履歴に追加し、Geminiに送信して応答を保存・読み上げる共通処理"""
+    st.session_state.messages.append({"role": "user", "content": display_text})
+
+    prompt_to_send = ai_prompt if ai_prompt is not None else display_text
+    contents_to_send = []
+
+    if attach_file and attach_bytes:
+        file_name = attach_file.name.lower()
+        if file_name.endswith(('.png', '.jpg', '.jpeg', '.pdf')):
+            try:
+                file_part = Part.from_bytes(
+                    data=attach_bytes,
+                    mime_type=attach_file.type
+                )
+                contents_to_send.append(file_part)
+            except Exception as e:
+                print(f"ファイルデータの変換エラー: {e}")
+        else:
+            try:
+                text_content = attach_bytes.decode("utf-8", errors="ignore")
+                prompt_to_send = f"【添付ファイル名: {attach_file.name}】\n```\n{text_content}\n```\n\n{prompt_to_send}"
+            except Exception as e:
+                print(f"テキスト読み込みエラー: {e}")
+
+    contents_to_send.append(prompt_to_send)
+
+    if st.session_state.chat:
+        try:
+            response = st.session_state.chat.send_message(contents_to_send)
+            response_text = response.text if hasattr(response, "text") else str(response)
+        except Exception as e:
+            response_text = f"Gemini APIエラー: {type(e).__name__} - {e}"
+    else:
+        response_text = "APIキーが設定されていないため応答できません。"
+
+    st.session_state.messages.append({"role": "assistant", "content": response_text})
+    st.session_state.latest_assistant_message = response_text
+    st.session_state.msg_counter += 1
+    st.rerun()
+
 # =========================================
 # メイン画面 UI
 # =========================================
 st.title("🎀 疑似教師AIユッキー")
 st.caption("ユッキーが解説してくれます！入力欄左端の「＋」から画像を添付して質問できます。")
+
+# ---------- ✍️ 手書きホワイトボード (途中式メモ・赤ペン添削) ----------
+with st.expander("✍️ 手書きホワイトボード (計算メモ・赤ペン添削)", expanded=False):
+    st.caption("マウスやタッチペンで途中式を書いて「🖍️ 添削して！」を押すと、ユッキーが赤ペン先生してくれます！")
+    wb_col1, wb_col2 = st.columns([4, 1])
+    with wb_col2:
+        wb_color = st.color_picker("ペンの色", "#1e293b", key="wb_color_picker")
+        wb_width = st.slider("線の太さ", 1, 10, 3, key="wb_width_slider")
+        if st.button("🗑️ 全消去", key="btn_clear_wb", use_container_width=True):
+            st.session_state.canvas_key_num += 1
+            st.rerun()
+    with wb_col1:
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 255, 255, 0)",
+            stroke_width=wb_width,
+            stroke_color=wb_color,
+            background_color="#ffffff",
+            height=200,
+            width=540,
+            drawing_mode="freedraw",
+            key=f"canvas_wb_{st.session_state.canvas_key_num}",
+        )
+    if st.button("🖍️ ユッキー、この途中式を添削して！", key="btn_submit_wb", use_container_width=True):
+        if canvas_result is not None and canvas_result.image_data is not None:
+            img_arr = canvas_result.image_data.astype('uint8')
+            pil_img = Image.fromarray(img_arr, 'RGBA')
+            buffered = io.BytesIO()
+            pil_img.save(buffered, format="PNG")
+            wb_bytes = buffered.getvalue()
+
+            class CanvasUpload:
+                name = "whiteboard.png"
+                type = "image/png"
+
+            send_message_to_assistant(
+                display_text="✍️ **【手書きメモ添削】** 途中式を書いたよ！見てみて！",
+                ai_prompt="【手書きメモ添削要請】ユーザーの手書き途中式・計算メモの画像です。どこまで合っているか優しく褒め、間違えている部分があれば赤ペン先生のように具体的にその箇所と理由を教えて、次のステップへ導いてください。",
+                attach_bytes=wb_bytes,
+                attach_file=CanvasUpload()
+            )
 
 # ---------- チャット履歴 ----------
 for msg in st.session_state.messages:
@@ -389,6 +652,70 @@ div[data-testid="stChatInput"] div[data-testid="stFileUploader"] section::after 
         left: 20px !important;
     }
 }
+
+/* ヒントバーのスタイリング */
+.hint-bar-wrapper {
+    margin-top: 18px;
+    margin-bottom: 8px;
+    padding: 8px 12px;
+    background: #fff8f8;
+    border-radius: 10px;
+    border-left: 4px solid #ff4b4b;
+}
+
+.hint-bar-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #e03e3e;
+}
+
+.hint-stage-badge {
+    display: inline-block;
+    background: #ff4b4b;
+    color: white;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 7px;
+    border-radius: 10px;
+    margin-left: 6px;
+    vertical-align: middle;
+}
+
+.hint-bar-sub {
+    font-size: 11px;
+    color: #888888;
+    margin-top: 2px;
+}
+
+/* ボタンのスタイル統一 */
+div.stButton > button {
+    border-radius: 10px !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    line-height: 1.3 !important;
+    padding: 8px 4px !important;
+    white-space: pre-line !important;
+    border: 1px solid #ffcccc !important;
+    background-color: #ffffff !important;
+    color: #333333 !important;
+    transition: all 0.2s ease !important;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.03) !important;
+}
+
+div.stButton > button:hover:not(:disabled) {
+    border-color: #ff4b4b !important;
+    background-color: #fff0f0 !important;
+    color: #ff4b4b !important;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(255, 75, 75, 0.15) !important;
+}
+
+div.stButton > button:disabled {
+    border-color: #eee !important;
+    background-color: #fafafa !important;
+    color: #bbb !important;
+    cursor: not-allowed !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -405,49 +732,188 @@ if uploaded_file:
     </div>
     """, unsafe_allow_html=True)
 
+# ---------- 🎯 3択クイズ インタラクティブ回答ボタン ----------
+if len(st.session_state.messages) > 0:
+    last_msg = st.session_state.messages[-1]
+    if last_msg["role"] == "assistant" and "【A】" in last_msg["content"] and "【B】" in last_msg["content"] and "【C】" in last_msg["content"]:
+        st.markdown("""
+        <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 12px; padding: 10px 14px; margin-top: 12px; margin-bottom: 8px;">
+            <span style="font-size: 13px; font-weight: bold; color: #1d4ed8;">🎯 ユッキーからのクイズ！答えを選んでね：</span>
+        </div>
+        """, unsafe_allow_html=True)
+        qc1, qc2, qc3 = st.columns(3)
+        with qc1:
+            if st.button("🅰️ 選択肢 A", key="quiz_choice_a", use_container_width=True):
+                send_message_to_assistant(
+                    display_text="私の回答: **A**",
+                    ai_prompt="【クイズ解答判定】ユーザーは『選択肢A』を選びました。正解かどうか判定し（ピンポン／ブブーなど）、優しく分かりやすく解説してください。"
+                )
+        with qc2:
+            if st.button("🅱️ 選択肢 B", key="quiz_choice_b", use_container_width=True):
+                send_message_to_assistant(
+                    display_text="私の回答: **B**",
+                    ai_prompt="【クイズ解答判定】ユーザーは『選択肢B』を選びました。正解かどうか判定し（ピンポン／ブブーなど）、優しく分かりやすく解説してください。"
+                )
+        with qc3:
+            if st.button("🅲 選択肢 C", key="quiz_choice_c", use_container_width=True):
+                send_message_to_assistant(
+                    display_text="私の回答: **C**",
+                    ai_prompt="【クイズ解答判定】ユーザーは『選択肢C』を選びました。正解かどうか判定し（ピンポン／ブブーなど）、優しく分かりやすく解説してください。"
+                )
+
+# ---------- ヒント＆ギブアップ クイックアクションバー ----------
+has_history = len(st.session_state.messages) > 0
+if not has_history:
+    st.session_state.hint_level = 1
+
+current_level = st.session_state.hint_level
+
+stage_descriptions = {
+    1: "💡 ヒント1（着眼点）が使えます",
+    2: "🔍 ヒント2（公式・考え方）が解放されました！",
+    3: "🔑 ヒント3（最初の一歩）が解放されました！",
+    4: "🏳️ ギブアップ（答えと全解説）が解放されました！"
+}
+stage_sub = stage_descriptions.get(current_level, "")
+
+# タイトル表示とリセット機能
+bar_col1, bar_col2 = st.columns([5, 1])
+with bar_col1:
+    st.markdown(f"""
+    <div class="hint-bar-wrapper">
+        <div class="hint-bar-title">🎯 段階的ヒント <span class="hint-stage-badge">ヒント {min(current_level, 3)}/3</span></div>
+        <div class="hint-bar-sub">{stage_sub if has_history else "質問を送信するとヒント1を利用できます"}</div>
+    </div>
+    """, unsafe_allow_html=True)
+with bar_col2:
+    if has_history and current_level > 1:
+        if st.button("🔄 最初へ", key="btn_reset_hint", help="ヒントをヒント1に戻します"):
+            st.session_state.hint_level = 1
+            st.rerun()
+
+# 段階的にボタンを増やす（最初はヒント1のみ、押下でヒント2が解放、順次ギブアップまで解放）
+num_cols = min(current_level, 4)
+cols = st.columns(num_cols)
+
+# ヒント1（常に表示）
+with cols[0]:
+    if st.button("💡 ヒント1\n着眼点", key="btn_hint_1", use_container_width=True, disabled=not has_history, help="どこに注目すべきかのポイントを教えてもらいます"):
+        st.session_state.hint_level = max(st.session_state.hint_level, 2)
+        send_message_to_assistant(
+            display_text="💡 **ヒント1（着眼点）** を教えて！",
+            ai_prompt="【ヒント1要請】答えや計算式は絶対に言わず、現在取り組んでいる問題の『着眼点（何に注目すべきか、注目ポイント）』だけを優しく教えてください。"
+        )
+
+# ヒント2（ヒント1押下後に表示）
+if current_level >= 2:
+    with cols[1]:
+        if st.button("🔍 ヒント2\n公式・考え方", key="btn_hint_2", use_container_width=True, disabled=not has_history, help="使うべき公式や解法の枠組みを教えてもらいます"):
+            st.session_state.hint_level = max(st.session_state.hint_level, 3)
+            send_message_to_assistant(
+                display_text="🔍 **ヒント2（公式・考え方）** を教えて！",
+                ai_prompt="【ヒント2要請】答えや計算結果は言わず、この問題で『使うべき公式・考え方のルール・定理』を優しく教えてください。"
+            )
+
+# ヒント3（ヒント2押下後に表示）
+if current_level >= 3:
+    with cols[2]:
+        if st.button("🔑 ヒント3\n最初の一歩", key="btn_hint_3", use_container_width=True, disabled=not has_history, help="式の1行目や解法の最初の一歩を教えてもらいます"):
+            st.session_state.hint_level = max(st.session_state.hint_level, 4)
+            send_message_to_assistant(
+                display_text="🔑 **ヒント3（最初の一歩）** を教えて！",
+                ai_prompt="【ヒント3要請】最後の答えは言わず、『解法の最初の一歩（式変形の1行目など）』を具体的に教えて、続きを考えられるように優しく導いてください。"
+            )
+
+# ギブアップ（ヒント3押下後に表示）
+if current_level >= 4:
+    with cols[3]:
+        if st.button("🏳️ ギブアップ\n答えと全解説", key="btn_give_up", use_container_width=True, disabled=not has_history, help="ここまでの努力を振り返り、完全な正解と詳しい解説を表示します"):
+            send_message_to_assistant(
+                display_text="🏳️ **ギブアップ！** 答えと全解説を教えて！",
+                ai_prompt="【ギブアップ要請】ここまで一生懸命考えた努力を惜しみなく褒めてから、この問題の『完全な正解』と『ステップバイステップのわかりやすい全解説』を優しく教えてください。"
+            )
+
+# ---------- 学習サポート アクションバー (解けた！ / 類題ガチャ / 理解度テスト) ----------
+if has_history:
+    st.markdown("<div style='margin-top: 10px;'></div>", unsafe_allow_html=True)
+    act_col1, act_col2, act_col3 = st.columns([1.2, 1, 1])
+
+    with act_col1:
+        if st.button("✨ 自力で解けた！", key="btn_solved_star", use_container_width=True, help="自力正解を報告してスターとスタンプを獲得！"):
+            if current_level == 1:
+                earned = 3
+                eval_msg = "パーフェクト！ノーヒントで自力で解き明かしました！"
+            elif current_level == 2:
+                earned = 2
+                eval_msg = "ナイスひらめき！ヒント1だけで解き切りました！"
+            elif current_level == 3:
+                earned = 1
+                eval_msg = "素晴らしい粘り強さ！ヒントを活用して解き切りました！"
+            else:
+                earned = 1
+                eval_msg = "完走おめでとう！最後まで諦めずに解き切りました！"
+
+            st.session_state.stars += earned
+            st.session_state.stamps += 1
+            save_user_data(st.session_state.loaded_user_id)
+            st.balloons()
+            send_message_to_assistant(
+                display_text=f"✨ **自力で解けたよ！（⭐×{earned}個 獲得！）**",
+                ai_prompt=f"【自力正解の称賛要請】ユーザーが見事に問題を解き終えました（{eval_msg}）。大喜びでたくさん褒めて、努力を称賛し、自信をつけさせてあげてください！"
+            )
+
+    with act_col2:
+        if st.button("🎲 類題ガチャ", key="btn_toggle_gacha", use_container_width=True, help="似た問題を出題して復習します"):
+            st.session_state.show_gacha = not st.session_state.show_gacha
+            st.rerun()
+
+    with act_col3:
+        if st.button("🎯 理解度テスト", key="btn_req_quiz", use_container_width=True, help="この問題に関する3択ミニテストを出題してもらいます"):
+            send_message_to_assistant(
+                display_text="🎯 **理解度テストを出題して！**",
+                ai_prompt="【理解度クイズ出題要請】直前の問題の要点や重要公式に関する「3択クイズ」を1問作成してください。出力は必ず以下の書式を含めてください：\n【問題】（ここに問題文）\n【A】（選択肢1）\n【B】（選択肢2）\n【C】（選択肢3）"
+            )
+
+    if st.session_state.show_gacha:
+        st.markdown("""
+        <div style="background: #fffbeb; border: 1px dashed #f59e0b; border-radius: 12px; padding: 8px 12px; margin-top: 8px; margin-bottom: 8px;">
+            <span style="font-size: 13px; font-weight: bold; color: #b45309;">🎲 類題ガチャ：挑戦する難易度を選んでね！</span>
+        </div>
+        """, unsafe_allow_html=True)
+        g_c1, g_c2, g_c3 = st.columns(3)
+        with g_c1:
+            if st.button("🟢 少しカンタン", key="gacha_easy", use_container_width=True):
+                st.session_state.hint_level = 1
+                st.session_state.show_gacha = False
+                send_message_to_assistant(
+                    display_text="🎲 **【類題ガチャ】少しカンタンな問題** をお願い！",
+                    ai_prompt="【類題出題要請】難易度:『少しカンタン』。直前の問題と同じ解法パターン・公式を使い、計算がよりシンプルな類題を1問出題してください。答えや解説は書かず、問題文だけを出して挑戦を促してください。"
+                )
+        with g_c2:
+            if st.button("🟡 同じレベル", key="gacha_mid", use_container_width=True):
+                st.session_state.hint_level = 1
+                st.session_state.show_gacha = False
+                send_message_to_assistant(
+                    display_text="🎲 **【類題ガチャ】同じレベルの問題** をお願い！",
+                    ai_prompt="【類題出題要請】難易度:『同じレベル』。直前の問題と同じ解法パターン・公式を使い、数値やシチュエーションを変えた類題を1問出題してください。答えや解説は書かず、問題文だけを出して挑戦を促してください。"
+                )
+        with g_c3:
+            if st.button("🔴 チャレンジ応用", key="gacha_hard", use_container_width=True):
+                st.session_state.hint_level = 1
+                st.session_state.show_gacha = False
+                send_message_to_assistant(
+                    display_text="🎲 **【類題ガチャ】チャレンジ応用問題** をお願い！",
+                    ai_prompt="【類題出題要請】難易度:『チャレンジ応用』。直前の問題の考え方を応用する、少しひねりのある発展類題を1問出題してください。答えや解説は書かず、問題文だけを出して挑戦を促してください。"
+                )
+
 # ---------- テキストチャット入力 ----------
 if prompt := st.chat_input("質問を入力してください…"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-
-    contents_to_send = []
-    
-    if uploaded_file and uploaded_bytes:
-        file_name = uploaded_file.name.lower()
-        
-        # 画像またはPDFの場合はPartオブジェクトとして送信
-        if file_name.endswith(('.png', '.jpg', '.jpeg', '.pdf')):
-            try:
-                file_part = Part.from_bytes(
-                    data=uploaded_bytes,
-                    mime_type=uploaded_file.type
-                )
-                contents_to_send.append(file_part)
-            except Exception as e:
-                print(f"ファイルデータの変換エラー: {e}")
-        else:
-            # それ以外のコードやテキストファイルは中身を読み込んでプロンプトに結合する
-            try:
-                text_content = uploaded_bytes.decode("utf-8", errors="ignore")
-                prompt = f"【添付ファイル名: {uploaded_file.name}】\n```\n{text_content}\n```\n\n{prompt}"
-            except Exception as e:
-                print(f"テキスト読み込みエラー: {e}")
-                
-    contents_to_send.append(prompt)
-            
-    if st.session_state.chat:
-        try:
-            response = st.session_state.chat.send_message(contents_to_send)
-            response_text = response.text if hasattr(response, "text") else str(response)
-        except Exception as e:
-            response_text = f"Gemini APIエラー: {type(e).__name__} - {e}"
-    else:
-        response_text = "APIキーが設定されていないため応答できません。"
-
-    st.session_state.messages.append({"role": "assistant", "content": response_text})
-    st.session_state.latest_assistant_message = response_text
-    st.session_state.msg_counter += 1
-
-    st.rerun()
+    send_message_to_assistant(
+        display_text=prompt,
+        ai_prompt=prompt,
+        attach_bytes=uploaded_bytes,
+        attach_file=uploaded_file
+    )
 
 # DOM操作でアップローダーとマイクボタンを stChatInput の内側に移動・追加するJSスクリプト
 components.html("""
